@@ -11,9 +11,24 @@ id: "snapshots"
 ## Overview
 
 ### What are snapshots?
-Analysts often need to "look back in time" at previous data states in their mutable tables. While some source data systems are built in a way that makes accessing historical data possible, this is not always the case. dbt provides a mechanism, **snapshots**, which records changes to a mutable <Term id="table" /> over time.
+Whether you call it "historic", "point in time", or "as-was", data about how things *used* to be provides a lot of value. Ideally, all of our data sources would have strategies for capturing history (like an [audit log](https://en.wikipedia.org/wiki/Audit_trail)) and all we would need to do is receive and transform that data.
 
-Snapshots implement [type-2 Slowly Changing Dimensions](https://en.wikipedia.org/wiki/Slowly_changing_dimension#Type_2:_add_new_row) over mutable source tables. These Slowly Changing Dimensions (or SCDs) identify how a row in a table changes over time. Imagine you have an `orders` table where the `status` field can be overwritten as the order is processed.
+However, there are many reasons that we might not be able to get access to historic information for a source. Maybe the source doesn't contain history at all, or the connector you're using doesn't support historic information, or the owner of the source doesn't support extracting historic information.
+
+Whatever the cause, if you have a source <Term id="table" /> that only provides current-state information, dbt **snapshots** provide a standard, code-first configuration for capturing these changes over time.
+
+Snapshots augment your source data by allowing you to capture changes. Snapshotting should be done on raw data, before staging, to ensure that you don't lose potentially helpful source information in the snapshotting step.
+
+Snapshots are best suited for sources that change slowly, because changes that occur in-between scheduled snapshot runs won't be captured. Specifically, snapshots provide a way to create a [type-2 Slowly Changing Dimension](https://en.wikipedia.org/wiki/Slowly_changing_dimension#Type_2:_add_new_row) table for your source.
+These Slowly Changing Dimensions (or SCDs) identify how a row in a table changes over time. 
+
+:::info Quickly changing sources
+
+For sources with meaningful changes that occur more quickly than you can snapshot them, you may need to look for a different approach for capturing historic data, like working with the provider of the source to access history or investigating [streaming data](https://en.wikipedia.org/wiki/Streaming_data) solutions.
+
+:::
+
+To understand how snapshots help you capture history, imagine you have an `orders` table where the `status` field can be overwritten as the order is processed.
 
 | id | status | updated_at |
 | -- | ------ | ---------- |
@@ -32,7 +47,9 @@ This order is now in the "shipped" state, but we've lost the information about w
 | 1 | pending | 2019-01-01 | 2019-01-01 | 2019-01-02 |
 | 1 | shipped | 2019-01-02 | 2019-01-02 | `null` |
 
-In dbt, snapshots are `select` statements, defined within a snapshot block in a `.sql` file (typically in your `snapshots` directory). You'll also need to configure your snapshot to tell dbt how to detect record changes.
+### How to define a snapshot
+
+In dbt, snapshots are `select` statements, defined within a snapshot block in a `.sql` file (typically in your `snapshots` directory). You'll also need to configure your snapshot to tell dbt how to detect record changes, including [choosing a strategy for detecting row changes](## Detecting row changes).
 
 <File name='snapshots/orders.sql'>
 
@@ -57,6 +74,14 @@ select * from {{ source('jaffle_shop', 'orders') }}
 
 </File>
 
+Note that it's the name of the snapshot block, *not* the `.sql` filename, that dbt uses to name the snapshot table. While it's possible to define multiple snapshots in the same file, it's good practice to stick to one snapshot per file and ensure the filename matches the snapshot name.
+
+### How to run a snapshot
+
+Snapshots use their own command, `snapshot`, which must be scheduled separately from dbt run.
+
+Creating an example snapshot is a great way to build an understanding of how snapshots work and how they can be configured. We'll start with a start-to-finish example of how to define and run a snapshot, then get into [detecting row changes](## Detecting row changes) and the [configuration details](## Configuring snapshots).
+
 :::info Preview or Compile Snapshots in IDE
 
 It is not possible to "preview data" or "compile sql" for snapshots in dbt Cloud. Instead, run the `dbt snapshot` command in the IDE by completing the following steps.
@@ -64,8 +89,8 @@ It is not possible to "preview data" or "compile sql" for snapshots in dbt Cloud
 :::
 
 When you run the [`dbt snapshot` command](snapshot):
-* **On the first run:** dbt will create the initial snapshot table — this will be the result set of your `select` statement, with additional columns including `dbt_valid_from` and `dbt_valid_to`. All records will have a `dbt_valid_to = null`.
-* **On subsequent runs:** dbt will check which records have changed or if any new records have been created:
+* **On the first run:** dbt will create the initial snapshot table — this will be the result set of your `select` statement, with additional columns including `dbt_valid_from` and `dbt_valid_to`. All records will have a `dbt_valid_to = null`. The timestamps in the `dbt_valid_from` field will depend on what [strategy](## Detecting row changes) you configure for detecting row changes.
+* **On subsequent runs:** dbt will check which records have changed and if any new records have been created:
   - The `dbt_valid_to` column will be updated for any existing records that have changed
   - The updated record and any new records will be inserted into the snapshot table. These records will now have `dbt_valid_to = null`
 
@@ -76,7 +101,7 @@ Snapshots can be referenced in downstream models the same way as referencing mod
 To add a snapshot to your project:
 
 1. Create a file in your `snapshots` directory with a `.sql` file extension, e.g. `snapshots/orders.sql`
-2. Use a `snapshot` block to define the start and end of a snapshot:
+2. Use a `snapshot` block to wrap the snapshot sql:
 
 <File name='snapshots/orders.sql'>
 
@@ -88,7 +113,7 @@ To add a snapshot to your project:
 
 </File>
 
-3. Write a `select` statement within the snapshot block (tips for writing a good snapshot query are below). This select statement defines the results that you want to snapshot over time. You can use `sources` and `refs` here.
+3. Write a `select` statement within the snapshot block (tips for writing a good snapshot query are below). This select statement defines the results that you want to snapshot over time. You can use `sources` and `refs` here. (Generally, you should only use `sources`.)
 
 <File name='snapshots/orders.sql'>
 
@@ -102,7 +127,7 @@ select * from {{ source('jaffle_shop', 'orders') }}
 
 </File>
 
-4. Check whether the result set of your query includes a reliable timestamp column that indicates when a record was last updated. For our example, the `updated_at` column reliably indicates record changes, so we can use the `timestamp` strategy. If your query result set does not have a reliable timestamp, you'll need to instead use the `check` strategy — more details on this below.
+4. Check whether the result set of your query includes a reliable timestamp column that indicates when a record was last updated. For our example, the `updated_at` column reliably indicates record changes, so we can use the `timestamp` [strategy](## Detecting row changes). If your query result set does not have a reliable timestamp, you'll need to instead use the `check` strategy — more details on this [below](## Detecting row changes).
 
 5. Add configurations to your snapshot using a `config` block (more details below). You can also configure your snapshot from your `dbt_project.yml` file ([docs](snapshot-configs)).
 
@@ -126,11 +151,12 @@ select * from {{ source('jaffle_shop', 'orders') }}
 
 {% endsnapshot %}
 ```
-Note: Unlike how [models can be configured at the directory level](/guides/legacy/best-practices#group-your-models-in-directories), the target schema for snapshots must be set in the config block.
 
 </File>
 
-6. Run the `dbt snapshot` [command](snapshot) — for our example a new table will be created at `analytics.snapshots.orders_snapshot`. You can change the `target_database` configuration, the `target_schema` configuration and the name of the snapshot (as defined in `{% snapshot .. %}`) will change how dbt names this table.
+6. Run the `dbt snapshot` [command](snapshot). In this case, a new table will be created at `analytics.snapshots.orders_snapshot` according to the target database, target schema, and name of the snapshot block. Though multiple snapshots *can* be defined in the same file, it's best practice to stick to one snapshot per file and ensure that the name of the file matches the name of the snapshot block. Unlike a <Term id="model" />, dbt will *not* use the snapshot filename when naming the table.
+
+Here's what a successful run looks like:
 
 ```
 $ dbt snapshot
@@ -152,7 +178,7 @@ Done. PASS=2 ERROR=0 SKIP=0 TOTAL=1
 
 8. Run the `snapshot` command again, and inspect the results. If any records have been updated, the snapshot should reflect this.
 
-9. Select from the `snapshot` in downstream models using the `ref` function.
+9. Select from the `snapshot` in downstream models using the `ref` function, using the snapshot name from the snapshot block.
 
 <File name='models/changed_orders.sql'>
 
@@ -162,20 +188,46 @@ select * from {{ ref('orders_snapshot') }}
 
 </File>
 
-10. Schedule the `snapshot` command to run regularly — snapshots are only useful if you run them frequently.
+10. Schedule the `snapshot` command to run regularly, ideally before `dbt run` commands that refer to snapshots. Changes that occur and are overwritten between snapshots won't be captured, so ensure that your snapshots are running frequently enough to capture the changes that you care about. Note that `dbt run` will *not* update snapshots. The `snapshot` command must be run separately.
+
+## Snapshot meta-fields
+
+Snapshot <Term id="table">tables</Term> will be created as a copy of your source dataset, plus some additional meta-fields:
+
+| Field          | Meaning | Usage |
+| -------------- | ------- | ----- |
+| dbt_valid_from | The timestamp when this snapshot row was first valid | This column can be used to order the different "versions" of a record. |
+| dbt_valid_to   | The timestamp when this row became invalid | The most recent snapshot record will have `dbt_valid_to` set to `null` |
+| dbt_scd_id     | A unique key generated for each snapshotted record | This is used internally by dbt |
+| dbt_updated_at | The updated_at timestamp of the source record when this snapshot row was inserted | This is used internally by dbt |
+
+The timestamps used for each column are subtly different depending on the [strategy](## Detecting row changes) you use:
+* For the `timestamp` strategy, the configured `updated_at` column is used to populate the `dbt_valid_from`, `dbt_valid_to` and `dbt_updated_at` columns accordingly.
+* For the `check` strategy, the snapshot timestamp is used to populate the `dbt_valid_from`, `dbt_valid_to`, and `dbt_updated_at` columns accordingly.
+
+:::info epoch integers and ISO date strings for updated_at
+For flexibility and predictable behavior, it's good practice to use a timestamp format field for `updated_at`. You can explicitly cast a [unix epoch integer](https://en.wikipedia.org/wiki/Unix_time) or an [ISO date string](https://en.wikipedia.org/wiki/ISO_8601) into a timestamp in your snapshot query. 
+
+However, as long as you aren't using the [`invalidate_hard_deletes`](### Hard deletes (optional)) configuruation option, unix epoch integers and ISO date strings can be configured as the `updated_at` field. The dbt meta-fields will inherit their data types from the configured `updated_at` field. ISO date strings will be implicitly cast to the date format at query when checking for newly modified rows. 
+
+Be aware that if you choose to use a unix epoch integer or ISO date string field, it will be very difficult to enable [`invalidate_hard_deletes`](### Hard deletes (optional)) if you want to in the future.
+
+:::
 
 
 ## Detecting row changes
-Snapshot "strategies" define how dbt knows if a row has changed. There are two strategies built-in to dbt — `timestamp` and `check`.
+Snapshot **strategies** define how dbt determines if a row has changed. There are two strategies to choose from: `timestamp` and `check`.
 
 ### Timestamp strategy (recommended)
 The `timestamp` strategy uses an `updated_at` field to determine if a row has changed. If the configured `updated_at` column for a row is more recent than the last time the snapshot ran, then dbt will invalidate the old record and record the new one. If the timestamps are unchanged, then dbt will not take any action.
+
+The `timestamp` strategy allows dbt to provide exact `dbt_valid_from` and `dbt_valid_to` timestamps for changes, since the `updated_at` field provides those exact timestamps. This means that when you first run a `timestamp` strategy snapshot, you'll get `dbt_valid_from` dates that are before the snapshot timestamp, since dbt "knows" how long that information has been valid for.
 
 The `timestamp` strategy requires the following configurations:
 
 | Config | Description | Example |
 | ------ | ----------- | ------- |
-| updated_at | A column which represents when the source row was last updated | `updated_at` |
+| updated_at | A column for when the source row was last updated | `updated_at` |
 
 **Example usage:**
 
@@ -203,6 +255,10 @@ The `timestamp` strategy requires the following configurations:
 ### Check strategy
 The `check` strategy is useful for tables which do not have a reliable `updated_at` column. This strategy works by comparing a list of columns between their current and historical values. If any of these columns have changed, then dbt will invalidate the old record and record the new one. If the column values are identical, then dbt will not take any action.
 
+This strategy is resource intensive, especially for wide tables. It's worth checking if the source owner can add a reliable `updated_at` field to your source table before comitting to a `check` strategy.
+
+The timestamps in the `dbt_valid_from` and `dbt_valid_to` fields will be limited by the frequency of your snapshots. When you first run a snapshot with a `check` strategy, you'll see that `dbt_valid_from` is set to the snapshot timestamp for all records, since dbt doesn't know how long that record has been valid for.
+
 The `check` strategy requires the following configurations:
 
 | Config | Description | Example |
@@ -213,7 +269,11 @@ The `check` strategy requires the following configurations:
 
 :::caution check_cols = 'all'
 
-The `check` snapshot strategy can be configured to track changes to _all_ columns by supplying `check_cols = 'all'`. This is thorough, but compute-intensive. Depending on the source data, you may end up capturing and storing changes for columns that aren't relevant. It's more efficient and predictable to explicitly enumerate the columns that you want to check. Consider using a <Term id="surrogate-key" /> to condense many columns into a single column.
+The `check` snapshot strategy can be configured to track changes to _all_ columns by supplying `check_cols = 'all'`. This is thorough, but compute-intensive. Depending on the source data, you may end up capturing and storing changes for columns that aren't relevant. Especially for wide tables, it's more efficient and predictable to explicitly enumerate the columns that you want to check. 
+
+If you know that a set of columns are always updated together, like a country string and a country code string, you can select only one of the columns to improve compute efficiency and query speed.
+
+Also, consider using a <Term id="surrogate-key" /> to condense many columns into a single column. This is especially helpful for columnular databases, since you significantly reduce the necessary compute resources by reducing the number of columns queried.
 
 :::
 
@@ -242,13 +302,13 @@ The `check` snapshot strategy can be configured to track changes to _all_ column
 </File>
 
 
-### Hard deletes (opt-in)
+### Hard deletes (optional)
 
 <Changelog>New in v0.19.0</Changelog>
 
-Rows that no longer appear in the source query are not invalidated by default. That is, `dbt_valid_to` remains null and the row continues to appear valid. If you want to mark the row as no longer valid when it disappears from the source query, use the config option `invalidate_hard_deletes`. When you set this parameter to `true`, at each snapshot run, dbt will compare the snapshot table to the source table. For any rows that no longer appear in the source query, `dbt_valid_to` will be set to the current snapshot time.
+This configuration changes the behavior of both the `timestamp` and `check` strategies to allow them to account for hard deletes in the source table.
 
-This configuration is not a different strategy as described above, but is an additional opt-in feature. It is not enabled by default since it alters the previous behavior and is only relevant for sources with hard deletes.
+By default, rows that no longer appear in the source query continue to appear valid. That is, `dbt_valid_to` remains null. If you want to mark the row as no longer valid when it disappears from the source query, use the config option `invalidate_hard_deletes`. When you set this parameter to `true`, at each snapshot run, dbt will compare the snapshot table to the source table. For any rows that no longer appear in the source query, `dbt_valid_to` will be set to the current snapshot time.
 
 For this configuration to work, the configured `updated_at` column must be of timestamp type. Otherwise, queries will fail due to mixing data types when dbt structures the comparison between the snapshot table and the source query.
 
@@ -279,7 +339,7 @@ For this configuration to work, the configured `updated_at` column must be of ti
 
 ## Configuring snapshots
 ### Snapshot configurations
-There are a number of snapshot-specific configurations:
+Here are the snapshot-specific configurations:
 
 | Config | Description | Required? | Example |
 | ------ | ----------- | --------- | ------- |
@@ -300,10 +360,10 @@ Note: As of v0.21, BigQuery users can use `target_project` and `target_dataset` 
 
 ### Configuration best practices
 #### Use the `timestamp` strategy where possible
-This strategy handles column additions and deletions better than the `check_cols` strategy. It also enables more accurate `dbt_valid_from` and `dbt_valid_to` timestamps.
+This strategy handles column additions and deletions better than the `check_cols` strategy. It's more compute efficient and enables more accurate `dbt_valid_from` and `dbt_valid_to` timestamps.
 
 #### Ensure your unique key is really unique
-The unique key is used by dbt to match rows up, so it's extremely important to make sure this key is actually unique! If you're snapshotting a source, I'd recommend adding a uniqueness test to your source ([example](https://github.com/dbt-labs/jaffle_shop/blob/8e7c853c858018180bef1756ec93e193d9958c5b/models/staging/schema.yml#L26)).
+The unique key is used by dbt to match rows up, so it's extremely important to make sure this key is actually unique! If you're snapshotting a source, it's good practice to add a uniqueness test to your source ([example](https://github.com/dbt-labs/jaffle_shop/blob/8e7c853c858018180bef1756ec93e193d9958c5b/models/staging/schema.yml#L26)).
 
 #### Use a `target_schema` that is separate to your analytics schema
 Snapshots cannot be rebuilt. If a snapshot table is dropped, the data it holds is lost. As such, it's a good idea to put snapshots in a separate schema so end users know they are special. From there, you may want to set different privileges on your snapshots compared to your models, and even run them as a different user (or role, depending on your warehouse) to make it very difficult to drop a snapshot unless you really want to.
@@ -317,7 +377,7 @@ Your models should then select from these snapshots, treating them like regular 
 This helps when understanding <Term id="data-lineage">data lineage</Term> in your project. It also emphasizes that snapshots are source data. Staging should come after snapshots, not before.
 
 #### Include as many columns as possible.
-In fact, go for `select *` if performance permits! Even if a column doesn't feel useful at the moment, it might be better to snapshot it in case it becomes useful – after all, you won't be able to recreate the column later.
+In fact, go for `select *` if performance permits! Even if a column doesn't feel useful at the moment, it might be better to snapshot it in case it becomes useful – after all, you won't be able to recreate the column later. (Even if you're using the `check` strategy and have decided to exclude a column from the `check_cols` parameter, you'll at least capture the column's new state the next time a checked column changes.)
 
 #### Avoid joins in your snapshot query.
 Joins can make it difficult to build a reliable `updated_at` timestamp. Instead, snapshot the two tables separately, and join them in downstream models.
@@ -326,26 +386,10 @@ Joins can make it difficult to build a reliable `updated_at` timestamp. Instead,
 If you apply business logic in a snapshot query, and this logic changes in the future, it can be impossible (or, at least, very difficult) to apply the change in logic to your snapshots.
 
 Basically – keep your query as simple as possible! Some reasonable exceptions to these recommendations include:
-* Selecting specific columns if the table is wide
+* Selecting specific columns if the source table is wide
 * Doing light transformation to get data into a reasonable shape, for example, unpacking a <Term id="json" /> blob to flatten your source data into columns
 * Renaming source columns that use special characters or keywords to ensure that snapshot queries and downstream queries behave as expected
-
-## Snapshot meta-fields
-
-Snapshot <Term id="table">tables</Term> will be created as a clone of your source dataset, plus some additional meta-fields*.
-
-| Field          | Meaning | Usage |
-| -------------- | ------- | ----- |
-| dbt_valid_from | The timestamp when this snapshot row was first valid | This column can be used to order the different "versions" of a record. |
-| dbt_valid_to   | The timestamp when this row became invalid | The most recent snapshot record will have `dbt_valid_to` set to `null` |
-| dbt_scd_id     | A unique key generated for each snapshotted record | This is used internally by dbt |
-| dbt_updated_at | The updated_at timestamp of the source record when this snapshot row was inserted | This is used internally by dbt |
-
-*The timestamps used for each column are subtly different depending on the strategy you use:
-* For the `check` strategy, the snapshot timestamp is used to populate the `dbt_valid_from`, `dbt_valid_to`, and `dbt_updated_at` columns accordingly.
-* For the `timestamp` strategy, the configured `updated_at` column is used to populate the `dbt_valid_from`, `dbt_valid_to` and `dbt_updated_at` columns accordingly.
-
-For flexibility and expected behavior, it's good practice to use a timestamp field for `updated_at`. You can explicitly cast a unix epoch integer or an ISO date string into a timestamp in your snapshot query. However, as long as you aren't using the [`invalidate_hard_deletes`](### Hard deletes (opt-in)) configuruation option, unix epoch integers and ISO date strings can be configured as the `updated_at` field. The dbt meta-fields will inherit their data types from the configured `updated_at` field. ISO date strings will be implicitly cast to date fields at query to support the greater-than/less-than comparisons for the snapshotting logic. However, be aware that if you choose to use a unix epoch integer or ISO date string field, it will be very difficult to enable [`invalidate_hard_deletes`](### Hard deletes (opt-in)) if you want to in the future.
+* Explicitly casting a [unix epoch integer](https://en.wikipedia.org/wiki/Unix_time) or [ISO date string](https://en.wikipedia.org/wiki/ISO_8601) `updated_at` column into a timestamp format
 
 <details>
 <summary>  Details for the timestamp strategy </summary>
